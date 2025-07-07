@@ -1,0 +1,129 @@
+%% Cerebellum SUIT Pipeline
+% This script runs segmentation, normalization, reslicing, and ROI summarization
+% using the SUIT toolbox and ANTs for cerebellar processing of MRI data.
+
+% --------------------------
+% Configuration (EDIT THIS)
+% --------------------------
+base_path = '/your/base/path'; % Set your own base path here
+suit_path = fullfile(base_path, 'software', 'suit');
+spm_path = '/opt/spm/12/';
+
+% --------------------------
+% Setup
+% --------------------------
+addpath(suit_path);
+addpath(genpath(spm_path));
+
+data_dir = fullfile(base_path, 'AO_Project', 'W1_T1', 'Preprocessed');
+sublist = dir(fullfile(data_dir, '3tb*', 'T1_reorient.nii'));
+subt1s = fullfile({sublist.folder}, {sublist.name})';
+subnum = numel(subt1s);
+
+% --------------------------
+% Loop over subjects
+% --------------------------
+for i = 1:subnum
+    t1 = subt1s{i};
+    fp = fileparts(t1);
+    [~, subject] = fileparts(fp);
+
+    fprintf('Running subject %s (%d/%d)\n', subject, i, subnum);
+
+    %% 1. SUIT Segmentation
+    cereb_file = fullfile(fp, 'c_T1_reorient_pcereb.nii');
+    if ~isfile(cereb_file)
+        fprintf('Segmenting %s\n', t1);
+        suit_isolate_seg({t1});
+    else
+        fprintf('Skipping segmentation: %s exists\n', cereb_file);
+    end
+
+    %% 2. SUIT Normalize Dartel
+    seg1 = fullfile(fp, 'T1_reorient_seg1.nii');
+    seg2 = fullfile(fp, 'T1_reorient_seg2.nii');
+    norm_out = fullfile(fp, 'u_a_T1_reorient_seg1.nii');
+
+    if all(isfile([seg1, seg2, cereb_file])) && ~isfile(norm_out)
+        fprintf('Normalizing %s\n', subject);
+        job.subjND.gray = {seg1};
+        job.subjND.white = {seg2};
+        job.subjND.isolation = {cereb_file};
+        suit_normalize_dartel(job);
+    else
+        fprintf('Skipping normalization for %s\n', subject);
+    end
+
+    %% 3. Reslice Dartel
+    affine_file = fullfile(fp, 'Affine_T1_reorient_seg1.mat');
+    wdT1 = fullfile(fp, 'wdT1_reorient.nii');
+    if all(isfile([affine_file, norm_out, cereb_file])) && ~isfile(wdT1)
+        fprintf('Reslicing %s\n', subject);
+        job = struct();
+        job.subj(1).affineTr = {affine_file};
+        job.subj(1).flowfield = {norm_out};
+        job.subj(1).resample = {t1};
+        job.subj(1).mask = {cereb_file};
+        suit_reslice_dartel(job);
+    else
+        fprintf('Skipping reslice for %s\n', subject);
+    end
+
+    %% 4. Reslice Dartel Inverse
+    iw_img = fullfile(fp, 'iw_wdT1_reorient_u_a_T1_reorient_seg1.nii');
+    if all(isfile([affine_file, norm_out, wdT1])) && ~isfile(iw_img)
+        fprintf('Inverse reslicing %s\n', subject);
+        job = struct();
+        job.Affine = {affine_file};
+        job.flowfield = {norm_out};
+        job.resample = {
+            wdT1
+            fullfile(suit_path, 'atlasesSUIT', 'Lobules-SUIT.nii')
+            fullfile(suit_path, 'atlasesSUIT', 'Ji_10Regions.nii')
+            fullfile(suit_path, 'atlasesSUIT', 'MDTB_10Regions.nii')
+        };
+        job.ref = {t1};
+        suit_reslice_dartel_inv(job);
+    else
+        fprintf('Skipping inverse reslice for %s\n', subject);
+    end
+
+    %% 5. Copy R2* Image
+    inp_r2 = fullfile(base_path, 'MRI', 'SWI', subject, 'nii', 'R2.nii.gz');
+    out_r2 = fullfile(fp, 'R2.nii.gz');
+    if isfile(inp_r2) && ~isfile(out_r2)
+        copyfile(inp_r2, out_r2);
+    end
+
+    %% 6. Register T1 to R2 and apply transforms
+    warp_file = fullfile(fp, 'T1_2_R2_0GenericAffine.mat');
+    out_T1 = fullfile(fp, 'T1_2_R2.nii');
+    if ~isfile(out_T1) && all(isfile([out_r2, t1]))
+        outmat = fullfile(fp, 'T1_2_R2_');
+        cmd = sprintf("antsRegistration --dimensionality 3 --output [%s,%s] --transform Rigid[0.1] --interpolation Linear --initial-moving-transform [%s,%s,1] --convergence [1000x500x250x100,1e-6,10] --shrink-factors 8x4x2x1 --smoothing-sigmas 3x2x1x0vox --metric MI[%s,%s,1,32,Regular,0.25]", ...
+            outmat, out_T1, out_r2, t1, out_r2, t1);
+        system(cmd);
+
+        warps = {
+            iw_img, fullfile(fp, 'iw_wdT1_reorient_u_a_T1_reorient_seg1_2_R2.nii');
+            fullfile(fp, 'iw_MDTB_10Regions_u_a_T1_reorient_seg1.nii'), fullfile(fp, 'iw_MDTB_10Regions_u_a_T1_reorient_seg1_2_R2.nii');
+            fullfile(fp, 'iw_Lobules-SUIT_u_a_T1_reorient_seg1.nii'), fullfile(fp, 'iw_Lobules-SUIT_u_a_T1_reorient_seg1_2_R2.nii');
+            fullfile(fp, 'iw_Ji_10Regions_u_a_T1_reorient_seg1.nii'), fullfile(fp, 'iw_Ji_10Regions_u_a_T1_reorient_seg1_2_R2.nii');
+        };
+        for j = 1:size(warps,1)
+            apply_cmd = sprintf('antsApplyTransforms -t %s -d 3 -i %s -r %s -o %s -n Linear', ...
+                warp_file, warps{j,1}, out_r2, warps{j,2});
+            system(apply_cmd);
+        end
+    end
+
+    %% 7. Extract Mean ROI Data
+    r2_img = out_r2;
+    roi_img = fullfile(fp, 'iw_Lobules-SUIT_u_a_T1_reorient_seg1_2_R2.nii');
+    out_txt = fullfile(fp, 'R2_Lobules.txt');
+    if all(isfile([r2_img, roi_img])) && ~isfile(out_txt)
+        fprintf('Extracting R2* for %s\n', subject);
+        fslcmd = sprintf('fslstats -K %s %s -M > %s', roi_img, r2_img, out_txt);
+        system(fslcmd);
+    end
+end
